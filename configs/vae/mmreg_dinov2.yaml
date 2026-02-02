@@ -1,0 +1,40 @@
+# MM-Reg VAE with DINOv2 reference
+
+# Model
+model:
+  pretrained_path: "stabilityai/sd-vae-ft-mse"
+  use_gradient_checkpointing: true
+
+# Data
+data:
+  dataset: "imagenette"  # imagenette, cifar10, imagenet
+  root: "./data"
+  image_size: 256
+  batch_size: 64
+  num_workers: 4
+
+# Loss
+loss:
+  lambda_mm: 0.1  # MM-Reg weight (tune this)
+  beta: 1.0
+  mm_variant: "correlation"  # correlation or si_mse
+  reconstruction_type: "mse"
+
+# Reference
+reference:
+  type: "dinov2"
+  model_name: "dinov2_vitb14"
+
+# Training
+training:
+  epochs: 5
+  learning_rate: 1.0e-5
+  weight_decay: 0.01
+  warmup_steps: 500
+  use_amp: true
+  log_interval: 50
+  save_every: 1
+
+# Output
+output:
+  save_dir: "./checkpoints/mmreg_dinov2"
