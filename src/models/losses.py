@@ -2,7 +2,12 @@
 MM-Reg Loss: Manifold-Matching Regularization for VAEs
 
 Core loss functions that enforce pairwise distance preservation between
-latent space and reference space (DINOv2 or PCA).
+latent space and pre-computed PCA reference space.
+
+Key insight: We pre-compute PCA projections for ALL training samples.
+During training, each batch looks up its corresponding PCA embeddings
+and compares pairwise distances: samples far apart in PCA space should
+remain far apart in latent space.
 """
 
 import torch
@@ -46,11 +51,6 @@ class MMRegLoss(nn.Module):
     """
 
     def __init__(self, variant: str = 'correlation', huber_delta: float = 1.0):
-        """
-        Args:
-            variant: 'correlation' or 'si_mse'
-            huber_delta: Delta parameter for Huber loss (only used with si_mse)
-        """
         super().__init__()
         self.variant = variant
         self.huber_delta = huber_delta
@@ -61,16 +61,16 @@ class MMRegLoss(nn.Module):
 
         Args:
             z: Latent vectors (B, D_latent) - flattened VAE latents
-            r: Reference vectors (B, D_ref) - DINOv2 or PCA embeddings
+            r: Reference vectors (B, D_ref) - pre-computed PCA projections
 
         Returns:
-            Scalar loss value
+            Scalar loss value (0 = perfect correlation, 2 = perfect anti-correlation)
         """
         # Compute pairwise distance matrices
         D_z = pairwise_distances(z)
         D_r = pairwise_distances(r)
 
-        # Extract upper triangular (unique pairs)
+        # Extract upper triangular (unique pairs, excludes diagonal)
         d_z = get_upper_triangular(D_z)
         d_r = get_upper_triangular(D_r)
 
@@ -85,32 +85,23 @@ class MMRegLoss(nn.Module):
         """
         Pearson correlation loss: L = 1 - correlation(d_z, d_r)
 
-        This is scale and shift invariant.
+        This is scale and shift invariant - dimensionality of PCA doesn't
+        need to match latent space.
         """
-        # Center the vectors
         d_z_centered = d_z - d_z.mean()
         d_r_centered = d_r - d_r.mean()
 
-        # Compute correlation
         cov = (d_z_centered * d_r_centered).mean()
         std_z = d_z_centered.std() + 1e-8
         std_r = d_r_centered.std() + 1e-8
 
         correlation = cov / (std_z * std_r)
-
         return 1.0 - correlation
 
     def _si_mse_loss(self, d_z: torch.Tensor, d_r: torch.Tensor) -> torch.Tensor:
-        """
-        Scale-Invariant MSE with Huber loss.
-
-        Normalizes distances by their means before computing loss.
-        """
-        # Normalize by mean (detach z normalization to avoid trivial solution)
+        """Scale-Invariant MSE with Huber loss."""
         d_z_norm = d_z / (d_z.mean().detach() + 1e-8)
         d_r_norm = d_r / (d_r.mean() + 1e-8)
-
-        # Huber loss for robustness
         return F.smooth_l1_loss(d_z_norm, d_r_norm, beta=self.huber_delta)
 
 
@@ -119,19 +110,26 @@ class VAELoss(nn.Module):
     Combined VAE loss with MM-Reg regularization.
 
     Total loss = reconstruction_loss + beta * kl_loss + lambda_mm * mm_loss
+
+    IMPORTANT scaling notes:
+    - recon_loss (MSE): typically ~0.01 for good reconstruction
+    - kl_loss: HUGE (~70,000) because it's summed over 4x32x32=4096 latent dims
+    - mm_loss: 0-2 range (1 - correlation)
+
+    Default beta=1e-6 scales KL to ~0.07, comparable to recon and mm.
     """
 
     def __init__(
         self,
-        lambda_mm: float = 0.1,
-        beta: float = 1.0,
+        lambda_mm: float = 1.0,
+        beta: float = 1e-6,  # Very small! KL is ~70k unscaled
         mm_variant: str = 'correlation',
         reconstruction_type: str = 'mse'
     ):
         """
         Args:
-            lambda_mm: Weight for MM-Reg loss
-            beta: Weight for KL divergence (beta-VAE)
+            lambda_mm: Weight for MM-Reg loss (default 1.0)
+            beta: Weight for KL divergence (default 1e-6, KL is naturally ~70k)
             mm_variant: 'correlation' or 'si_mse'
             reconstruction_type: 'mse' or 'lpips'
         """
@@ -139,14 +137,11 @@ class VAELoss(nn.Module):
         self.lambda_mm = lambda_mm
         self.beta = beta
         self.reconstruction_type = reconstruction_type
-        self.mm_loss = MMRegLoss(variant=mm_variant)
-
-        # LPIPS for perceptual loss (optional)
+        self.mm_loss_fn = MMRegLoss(variant=mm_variant)
         self._lpips = None
 
     @property
     def lpips(self):
-        """Lazy load LPIPS to avoid import issues."""
         if self._lpips is None and self.reconstruction_type == 'lpips':
             import lpips
             self._lpips = lpips.LPIPS(net='alex').eval()
@@ -155,23 +150,13 @@ class VAELoss(nn.Module):
         return self._lpips
 
     def reconstruction_loss(self, x: torch.Tensor, x_recon: torch.Tensor) -> torch.Tensor:
-        """Compute reconstruction loss."""
         if self.reconstruction_type == 'mse':
             return F.mse_loss(x_recon, x)
         elif self.reconstruction_type == 'lpips':
-            # LPIPS expects inputs in [-1, 1]
             lpips_model = self.lpips.to(x.device)
             return lpips_model(x, x_recon).mean()
         else:
             raise ValueError(f"Unknown reconstruction type: {self.reconstruction_type}")
-
-    def kl_loss(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-        """
-        KL divergence loss for VAE.
-
-        For diffusers AutoencoderKL, this is computed from the posterior.
-        """
-        return -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
 
     def forward(
         self,
@@ -188,26 +173,22 @@ class VAELoss(nn.Module):
             x: Original images (B, C, H, W)
             x_recon: Reconstructed images (B, C, H, W)
             z: Latent vectors, flattened (B, D_latent)
-            r: Reference vectors (B, D_ref)
-            posterior: VAE posterior for KL computation (diffusers style)
+            r: Reference vectors (B, D_ref) - PRE-COMPUTED PCA projections
+            posterior: VAE posterior for KL computation
 
         Returns:
             Dictionary with total loss and individual components
         """
-        # Reconstruction loss
         recon_loss = self.reconstruction_loss(x, x_recon)
 
-        # KL loss
         if posterior is not None:
-            # For diffusers AutoencoderKL
-            kl_loss = posterior.kl().mean()
+            kl_loss = posterior.kl().mean()  # Mean over batch, sum over dims
         else:
             kl_loss = torch.tensor(0.0, device=x.device)
 
-        # MM-Reg loss
-        mm_loss = self.mm_loss(z, r)
+        mm_loss = self.mm_loss_fn(z, r)
 
-        # Total loss
+        # Properly scaled total loss
         total_loss = recon_loss + self.beta * kl_loss + self.lambda_mm * mm_loss
 
         return {

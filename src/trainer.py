@@ -1,10 +1,9 @@
 """
 Training logic for MM-Reg VAE.
 
-Handles:
-- Training loop with mixed precision
-- Logging and checkpointing
-- Evaluation metrics
+Supports two modes:
+1. Pre-computed PCA embeddings (recommended): Dataset returns (image, label, pca_embedding)
+2. Online reference computation: Uses a reference model (DINOv2) to compute embeddings on-the-fly
 """
 
 import torch
@@ -21,16 +20,19 @@ from pathlib import Path
 class MMRegTrainer:
     """
     Trainer for MM-Reg VAE finetuning.
+
+    Supports pre-computed PCA embeddings (faster, recommended) or
+    online reference computation via a reference model.
     """
 
     def __init__(
         self,
         vae: nn.Module,
-        reference_model: nn.Module,
         loss_fn: nn.Module,
         optimizer: torch.optim.Optimizer,
         train_loader: DataLoader,
         val_loader: Optional[DataLoader] = None,
+        reference_model: Optional[nn.Module] = None,
         device: str = 'cuda',
         use_amp: bool = True,
         log_interval: int = 50,
@@ -40,11 +42,11 @@ class MMRegTrainer:
         """
         Args:
             vae: MMRegVAE model
-            reference_model: Reference extractor (DINOv2/PCA)
             loss_fn: VAELoss with MM-Reg
             optimizer: Optimizer
-            train_loader: Training data loader
+            train_loader: Training data loader (returns (img, label, pca_emb) or (img, label))
             val_loader: Validation data loader
+            reference_model: Optional reference extractor (only needed if not using pre-computed PCA)
             device: Training device
             use_amp: Use automatic mixed precision
             log_interval: Steps between logging
@@ -78,13 +80,36 @@ class MMRegTrainer:
         # Create save directory
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
-    def train_epoch(self) -> Dict[str, float]:
+        # Detect mode based on first batch
+        self._using_precomputed_pca = None
+
+    def _get_reference_features(self, batch, images):
         """
-        Train for one epoch.
+        Get reference features either from pre-computed PCA or online computation.
+
+        Args:
+            batch: Full batch tuple from dataloader
+            images: Image tensor (already on device)
 
         Returns:
-            Dictionary of average metrics
+            Reference features tensor
         """
+        if len(batch) == 3:
+            # Pre-computed PCA: batch = (images, labels, pca_embeddings)
+            _, _, ref_features = batch
+            return ref_features.to(self.device)
+        elif len(batch) == 2 and self.reference_model is not None:
+            # Online computation
+            with torch.no_grad():
+                return self.reference_model(images)
+        else:
+            raise ValueError(
+                "Either provide pre-computed PCA embeddings in the dataset "
+                "or pass a reference_model for online computation"
+            )
+
+    def train_epoch(self) -> Dict[str, float]:
+        """Train for one epoch."""
         self.vae.train()
         epoch_metrics = {
             'loss': 0.0,
@@ -96,12 +121,10 @@ class MMRegTrainer:
 
         pbar = tqdm(self.train_loader, desc=f"Epoch {self.epoch}")
 
-        for batch_idx, (images, _) in enumerate(pbar):
-            images = images.to(self.device)
-
-            # Get reference embeddings (no grad)
-            with torch.no_grad():
-                ref_features = self.reference_model(images)
+        for batch_idx, batch in enumerate(pbar):
+            # Handle both (img, label) and (img, label, pca_emb) formats
+            images = batch[0].to(self.device)
+            ref_features = self._get_reference_features(batch, images)
 
             # Forward pass with mixed precision
             self.optimizer.zero_grad()
@@ -117,7 +140,6 @@ class MMRegTrainer:
                         posterior=outputs['posterior']
                     )
 
-                # Backward with scaling
                 self.scaler.scale(losses['loss']).backward()
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
@@ -134,7 +156,6 @@ class MMRegTrainer:
                 losses['loss'].backward()
                 self.optimizer.step()
 
-            # Update scheduler
             if self.scheduler is not None:
                 self.scheduler.step()
 
@@ -152,7 +173,6 @@ class MMRegTrainer:
                     'mm': f"{losses['mm_loss'].item():.4f}"
                 })
 
-        # Average metrics
         for key in epoch_metrics:
             epoch_metrics[key] /= num_batches
 
@@ -160,12 +180,7 @@ class MMRegTrainer:
 
     @torch.no_grad()
     def validate(self) -> Dict[str, float]:
-        """
-        Run validation.
-
-        Returns:
-            Dictionary of average metrics
-        """
+        """Run validation."""
         if self.val_loader is None:
             return {}
 
@@ -178,16 +193,13 @@ class MMRegTrainer:
         }
         num_batches = 0
 
-        for images, _ in tqdm(self.val_loader, desc="Validation"):
-            images = images.to(self.device)
+        for batch in tqdm(self.val_loader, desc="Validation"):
+            images = batch[0].to(self.device)
+            ref_features = self._get_reference_features(batch, images)
 
-            # Get reference embeddings
-            ref_features = self.reference_model(images)
-
-            # Forward pass
             if self.use_amp:
                 with autocast():
-                    outputs = self.vae(images, sample=False)  # Use mean for val
+                    outputs = self.vae(images, sample=False)
                     losses = self.loss_fn(
                         x=images,
                         x_recon=outputs['x_recon'],
@@ -205,41 +217,33 @@ class MMRegTrainer:
                     posterior=outputs['posterior']
                 )
 
-            # Accumulate metrics
             for key in val_metrics:
                 val_metrics[key] += losses[key].item()
             num_batches += 1
 
-        # Average metrics
         for key in val_metrics:
             val_metrics[key] /= num_batches
 
         return val_metrics
 
     def train(self, num_epochs: int, save_every: int = 1):
-        """
-        Full training loop.
-
-        Args:
-            num_epochs: Number of epochs to train
-            save_every: Save checkpoint every N epochs
-        """
+        """Full training loop."""
         print(f"Starting training for {num_epochs} epochs")
         print(f"Device: {self.device}, AMP: {self.use_amp}")
+        print(f"Loss weights: beta={self.loss_fn.beta}, lambda_mm={self.loss_fn.lambda_mm}")
 
         for epoch in range(num_epochs):
             self.epoch = epoch
 
-            # Train
             train_metrics = self.train_epoch()
             self.train_history.append(train_metrics)
 
             print(f"\nEpoch {epoch} - Train: " +
                   f"loss={train_metrics['loss']:.4f}, " +
                   f"recon={train_metrics['recon_loss']:.4f}, " +
+                  f"kl={train_metrics['kl_loss']:.2f}, " +
                   f"mm={train_metrics['mm_loss']:.4f}")
 
-            # Validate
             if self.val_loader is not None:
                 val_metrics = self.validate()
                 self.val_history.append(val_metrics)
@@ -247,21 +251,18 @@ class MMRegTrainer:
                 print(f"Epoch {epoch} - Val: " +
                       f"loss={val_metrics['loss']:.4f}, " +
                       f"recon={val_metrics['recon_loss']:.4f}, " +
+                      f"kl={val_metrics['kl_loss']:.2f}, " +
                       f"mm={val_metrics['mm_loss']:.4f}")
 
-                # Save best model
                 if val_metrics['loss'] < self.best_val_loss:
                     self.best_val_loss = val_metrics['loss']
                     self.save_checkpoint('best.pt')
 
-            # Save periodic checkpoint
             if (epoch + 1) % save_every == 0:
                 self.save_checkpoint(f'epoch_{epoch}.pt')
 
-        # Save final checkpoint
         self.save_checkpoint('final.pt')
         self.save_history()
-
         print("Training complete!")
 
     def save_checkpoint(self, filename: str):
