@@ -37,8 +37,12 @@ class MMRegVAE(nn.Module):
 
         # Enable gradient checkpointing for memory efficiency
         if use_gradient_checkpointing:
-            self.vae.encoder.gradient_checkpointing = True
-            self.vae.decoder.gradient_checkpointing = True
+            try:
+                # New diffusers API
+                self.vae.enable_gradient_checkpointing()
+            except AttributeError:
+                # Fallback for older versions
+                pass
 
         # Store config
         self.latent_channels = self.vae.config.latent_channels  # Usually 4
