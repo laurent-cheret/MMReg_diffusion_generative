@@ -70,8 +70,8 @@ class MMRegVAE(nn.Module):
         # Scale latents (SD convention)
         latent = latent * self.scaling_factor
 
-        # Flatten for MM-Reg
-        latent_flat = latent.view(latent.shape[0], -1)
+        # Flatten for MM-Reg (use reshape for non-contiguous tensors)
+        latent_flat = latent.reshape(latent.shape[0], -1)
 
         return {
             'latent': latent,
