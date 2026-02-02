@@ -1,5 +1,5 @@
-# Data
-data/
+# Data (only root data folder, not src/data)
+/data/
 *.tar.gz
 *.tgz
 
