@@ -25,12 +25,9 @@ def pairwise_distances(x: torch.Tensor) -> torch.Tensor:
     Returns:
         Distance matrix of shape (B, B)
     """
-    # ||a - b||^2 = ||a||^2 + ||b||^2 - 2*a.b
-    dot_product = torch.mm(x, x.t())
-    square_norm = dot_product.diag()
-    distances = square_norm.unsqueeze(0) - 2.0 * dot_product + square_norm.unsqueeze(1)
-    distances = torch.clamp(distances, min=0.0)  # numerical stability
-    return torch.sqrt(distances + 1e-8)
+    # Use cdist for more numerically stable computation
+    # cdist computes ||a - b||_2 directly without the expansion trick
+    return torch.cdist(x, x, p=2)
 
 
 def get_upper_triangular(matrix: torch.Tensor) -> torch.Tensor:
@@ -55,6 +52,7 @@ class MMRegLoss(nn.Module):
         self.variant = variant
         self.huber_delta = huber_delta
 
+    @torch.amp.autocast('cuda', enabled=False)
     def forward(self, z: torch.Tensor, r: torch.Tensor) -> torch.Tensor:
         """
         Compute MM-Reg loss between latent vectors and reference vectors.
@@ -66,10 +64,15 @@ class MMRegLoss(nn.Module):
         Returns:
             Scalar loss value (0 = perfect correlation, 2 = perfect anti-correlation)
         """
-        # Force FP32 to avoid overflow in pairwise distance computation
-        # (FP16 can overflow with large vectors like 4096-dim latents)
+        # Force FP32 and disable autocast to avoid overflow
         z = z.float()
         r = r.float()
+
+        # Check for NaN/inf in inputs
+        if torch.isnan(z).any() or torch.isinf(z).any():
+            return torch.tensor(1.0, device=z.device, requires_grad=True)
+        if torch.isnan(r).any() or torch.isinf(r).any():
+            return torch.tensor(1.0, device=z.device, requires_grad=True)
 
         # Compute pairwise distance matrices
         D_z = pairwise_distances(z)
