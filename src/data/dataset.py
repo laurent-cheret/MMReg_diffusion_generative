@@ -118,8 +118,8 @@ def compute_pca_embeddings(
 
     Args:
         dataset: Dataset to compute embeddings for (should use fixed transforms!)
-        n_components: Number of PCA components
-        batch_size: Batch size for processing
+        n_components: Number of PCA components (can be any value up to min(n_samples, n_features))
+        batch_size: Batch size for processing (will be adjusted if < n_components)
         device: Device to use
 
     Returns:
@@ -127,7 +127,12 @@ def compute_pca_embeddings(
     """
     from sklearn.decomposition import IncrementalPCA
 
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+    # IncrementalPCA requires batch_size >= n_components
+    # Adjust batch_size if needed
+    pca_batch_size = max(batch_size, n_components)
+    print(f"Using batch_size={pca_batch_size} for PCA (n_components={n_components})")
+
+    loader = DataLoader(dataset, batch_size=pca_batch_size, shuffle=False, num_workers=4)
 
     # First pass: fit PCA incrementally
     print("Fitting PCA...")
@@ -138,11 +143,12 @@ def compute_pca_embeddings(
         flat = images.view(images.shape[0], -1).numpy()
         pca.partial_fit(flat)
 
-    # Second pass: transform all samples
+    # Second pass: transform all samples (can use smaller batches)
     print("Transforming samples...")
+    transform_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4)
     all_embeddings = []
 
-    for images, _ in loader:
+    for images, _ in transform_loader:
         flat = images.view(images.shape[0], -1).numpy()
         emb = pca.transform(flat)
         all_embeddings.append(torch.from_numpy(emb).float())
