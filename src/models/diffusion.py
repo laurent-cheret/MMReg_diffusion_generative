@@ -1,0 +1,373 @@
+"""
+Simple Diffusion Model for Latent Space.
+
+A lightweight UNet-based diffusion model that operates on VAE latents (32x32x4).
+Uses DDPM (Denoising Diffusion Probabilistic Models) formulation.
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+from typing import Optional, Tuple
+
+
+def get_timestep_embedding(timesteps: torch.Tensor, embedding_dim: int) -> torch.Tensor:
+    """
+    Sinusoidal timestep embeddings.
+
+    Args:
+        timesteps: (B,) tensor of timesteps
+        embedding_dim: Dimension of embedding
+
+    Returns:
+        (B, embedding_dim) tensor of embeddings
+    """
+    half_dim = embedding_dim // 2
+    emb = math.log(10000) / (half_dim - 1)
+    emb = torch.exp(torch.arange(half_dim, device=timesteps.device) * -emb)
+    emb = timesteps[:, None].float() * emb[None, :]
+    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
+    if embedding_dim % 2 == 1:
+        emb = F.pad(emb, (0, 1))
+    return emb
+
+
+class ResBlock(nn.Module):
+    """Residual block with timestep conditioning."""
+
+    def __init__(self, in_channels: int, out_channels: int, time_emb_dim: int):
+        super().__init__()
+        self.norm1 = nn.GroupNorm(8, in_channels)
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
+        self.norm2 = nn.GroupNorm(8, out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
+
+        self.time_mlp = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(time_emb_dim, out_channels)
+        )
+
+        if in_channels != out_channels:
+            self.skip = nn.Conv2d(in_channels, out_channels, 1)
+        else:
+            self.skip = nn.Identity()
+
+    def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
+        h = self.norm1(x)
+        h = F.silu(h)
+        h = self.conv1(h)
+
+        # Add timestep embedding
+        h = h + self.time_mlp(t_emb)[:, :, None, None]
+
+        h = self.norm2(h)
+        h = F.silu(h)
+        h = self.conv2(h)
+
+        return h + self.skip(x)
+
+
+class AttentionBlock(nn.Module):
+    """Self-attention block."""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.norm = nn.GroupNorm(8, channels)
+        self.qkv = nn.Conv2d(channels, channels * 3, 1)
+        self.proj = nn.Conv2d(channels, channels, 1)
+        self.scale = channels ** -0.5
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        h = self.norm(x)
+        qkv = self.qkv(h).reshape(B, 3, C, H * W)
+        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
+
+        attn = torch.bmm(q.transpose(1, 2), k) * self.scale
+        attn = F.softmax(attn, dim=-1)
+
+        h = torch.bmm(v, attn.transpose(1, 2))
+        h = h.reshape(B, C, H, W)
+        h = self.proj(h)
+
+        return x + h
+
+
+class SimpleUNet(nn.Module):
+    """
+    Simple UNet for latent diffusion.
+
+    Designed for 32x32x4 latent space.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 4,
+        base_channels: int = 128,
+        channel_mult: Tuple[int, ...] = (1, 2, 4),
+        num_res_blocks: int = 2,
+        time_emb_dim: int = 256
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.time_emb_dim = time_emb_dim
+
+        # Time embedding
+        self.time_mlp = nn.Sequential(
+            nn.Linear(time_emb_dim, time_emb_dim * 4),
+            nn.SiLU(),
+            nn.Linear(time_emb_dim * 4, time_emb_dim)
+        )
+
+        # Input conv
+        self.input_conv = nn.Conv2d(in_channels, base_channels, 3, padding=1)
+
+        # Encoder
+        self.encoder_blocks = nn.ModuleList()
+        self.downsample = nn.ModuleList()
+
+        channels = [base_channels]
+        ch = base_channels
+
+        for i, mult in enumerate(channel_mult):
+            out_ch = base_channels * mult
+            for _ in range(num_res_blocks):
+                self.encoder_blocks.append(ResBlock(ch, out_ch, time_emb_dim))
+                ch = out_ch
+                channels.append(ch)
+
+            if i < len(channel_mult) - 1:
+                self.downsample.append(nn.Conv2d(ch, ch, 3, stride=2, padding=1))
+                channels.append(ch)
+
+        # Middle
+        self.middle_block1 = ResBlock(ch, ch, time_emb_dim)
+        self.middle_attn = AttentionBlock(ch)
+        self.middle_block2 = ResBlock(ch, ch, time_emb_dim)
+
+        # Decoder
+        self.decoder_blocks = nn.ModuleList()
+        self.upsample = nn.ModuleList()
+
+        for i, mult in reversed(list(enumerate(channel_mult))):
+            out_ch = base_channels * mult
+            for j in range(num_res_blocks + 1):
+                skip_ch = channels.pop()
+                self.decoder_blocks.append(ResBlock(ch + skip_ch, out_ch, time_emb_dim))
+                ch = out_ch
+
+            if i > 0:
+                self.upsample.append(nn.ConvTranspose2d(ch, ch, 4, stride=2, padding=1))
+
+        # Output
+        self.output_norm = nn.GroupNorm(8, ch)
+        self.output_conv = nn.Conv2d(ch, in_channels, 3, padding=1)
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass.
+
+        Args:
+            x: Noisy latents (B, 4, 32, 32)
+            t: Timesteps (B,)
+
+        Returns:
+            Predicted noise (B, 4, 32, 32)
+        """
+        # Time embedding
+        t_emb = get_timestep_embedding(t, self.time_emb_dim)
+        t_emb = self.time_mlp(t_emb)
+
+        # Input
+        h = self.input_conv(x)
+
+        # Encoder
+        skips = [h]
+        block_idx = 0
+        downsample_idx = 0
+
+        for i, mult in enumerate(self.encoder_blocks):
+            h = self.encoder_blocks[block_idx](h, t_emb)
+            skips.append(h)
+            block_idx += 1
+
+        # Handle downsampling
+        skip_idx = 0
+        h = self.input_conv(x)
+        skips = [h]
+
+        blocks_per_level = 2  # num_res_blocks
+        for level_idx in range(len([1, 2, 4])):  # channel_mult
+            for _ in range(blocks_per_level):
+                if skip_idx < len(self.encoder_blocks):
+                    h = self.encoder_blocks[skip_idx](h, t_emb)
+                    skips.append(h)
+                    skip_idx += 1
+
+            if level_idx < len([1, 2, 4]) - 1 and downsample_idx < len(self.downsample):
+                h = self.downsample[downsample_idx](h)
+                skips.append(h)
+                downsample_idx += 1
+
+        # Middle
+        h = self.middle_block1(h, t_emb)
+        h = self.middle_attn(h)
+        h = self.middle_block2(h, t_emb)
+
+        # Decoder
+        block_idx = 0
+        upsample_idx = 0
+
+        for level_idx in range(len([1, 2, 4])):
+            for _ in range(blocks_per_level + 1):
+                if skips and block_idx < len(self.decoder_blocks):
+                    skip = skips.pop()
+                    h = torch.cat([h, skip], dim=1)
+                    h = self.decoder_blocks[block_idx](h, t_emb)
+                    block_idx += 1
+
+            if level_idx < len([1, 2, 4]) - 1 and upsample_idx < len(self.upsample):
+                h = self.upsample[upsample_idx](h)
+                upsample_idx += 1
+
+        # Output
+        h = self.output_norm(h)
+        h = F.silu(h)
+        h = self.output_conv(h)
+
+        return h
+
+
+class GaussianDiffusion:
+    """
+    DDPM Gaussian Diffusion.
+
+    Implements the forward (noising) and reverse (denoising) processes.
+    """
+
+    def __init__(
+        self,
+        num_timesteps: int = 1000,
+        beta_start: float = 0.0001,
+        beta_end: float = 0.02,
+        device: str = 'cuda'
+    ):
+        self.num_timesteps = num_timesteps
+        self.device = device
+
+        # Linear beta schedule
+        betas = torch.linspace(beta_start, beta_end, num_timesteps, device=device)
+
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value=1.0)
+
+        self.betas = betas
+        self.alphas = alphas
+        self.alphas_cumprod = alphas_cumprod
+        self.alphas_cumprod_prev = alphas_cumprod_prev
+
+        # For q(x_t | x_0)
+        self.sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
+        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - alphas_cumprod)
+
+        # For posterior q(x_{t-1} | x_t, x_0)
+        self.posterior_variance = betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
+        self.posterior_log_variance = torch.log(torch.clamp(self.posterior_variance, min=1e-20))
+        self.posterior_mean_coef1 = betas * torch.sqrt(alphas_cumprod_prev) / (1.0 - alphas_cumprod)
+        self.posterior_mean_coef2 = (1.0 - alphas_cumprod_prev) * torch.sqrt(alphas) / (1.0 - alphas_cumprod)
+
+    def q_sample(self, x_0: torch.Tensor, t: torch.Tensor, noise: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward process: q(x_t | x_0).
+
+        Args:
+            x_0: Clean latents (B, C, H, W)
+            t: Timesteps (B,)
+            noise: Optional pre-generated noise
+
+        Returns:
+            Tuple of (noisy latents, noise)
+        """
+        if noise is None:
+            noise = torch.randn_like(x_0)
+
+        sqrt_alpha = self.sqrt_alphas_cumprod[t][:, None, None, None]
+        sqrt_one_minus_alpha = self.sqrt_one_minus_alphas_cumprod[t][:, None, None, None]
+
+        x_t = sqrt_alpha * x_0 + sqrt_one_minus_alpha * noise
+        return x_t, noise
+
+    def p_losses(self, model: nn.Module, x_0: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """
+        Compute training loss.
+
+        Args:
+            model: Denoising model
+            x_0: Clean latents
+            t: Timesteps
+
+        Returns:
+            MSE loss
+        """
+        x_t, noise = self.q_sample(x_0, t)
+        predicted_noise = model(x_t, t)
+        loss = F.mse_loss(predicted_noise, noise)
+        return loss
+
+    @torch.no_grad()
+    def p_sample(self, model: nn.Module, x_t: torch.Tensor, t: int) -> torch.Tensor:
+        """
+        Reverse process: sample x_{t-1} from x_t.
+        """
+        batch_size = x_t.shape[0]
+        t_tensor = torch.full((batch_size,), t, device=self.device, dtype=torch.long)
+
+        # Predict noise
+        predicted_noise = model(x_t, t_tensor)
+
+        # Get coefficients
+        alpha = self.alphas[t]
+        alpha_cumprod = self.alphas_cumprod[t]
+        beta = self.betas[t]
+
+        # Compute mean
+        coef1 = 1.0 / torch.sqrt(alpha)
+        coef2 = beta / self.sqrt_one_minus_alphas_cumprod[t]
+        mean = coef1 * (x_t - coef2 * predicted_noise)
+
+        if t > 0:
+            noise = torch.randn_like(x_t)
+            variance = torch.sqrt(self.posterior_variance[t])
+            x_t_minus_1 = mean + variance * noise
+        else:
+            x_t_minus_1 = mean
+
+        return x_t_minus_1
+
+    @torch.no_grad()
+    def sample(self, model: nn.Module, shape: Tuple[int, ...], progress: bool = True) -> torch.Tensor:
+        """
+        Generate samples by running the full reverse process.
+
+        Args:
+            model: Denoising model
+            shape: Shape of samples to generate (B, C, H, W)
+            progress: Show progress bar
+
+        Returns:
+            Generated latents
+        """
+        model.eval()
+        x = torch.randn(shape, device=self.device)
+
+        timesteps = reversed(range(self.num_timesteps))
+        if progress:
+            from tqdm import tqdm
+            timesteps = tqdm(timesteps, desc="Sampling", total=self.num_timesteps)
+
+        for t in timesteps:
+            x = self.p_sample(model, x, t)
+
+        return x
