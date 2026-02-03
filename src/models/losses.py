@@ -66,6 +66,11 @@ class MMRegLoss(nn.Module):
         Returns:
             Scalar loss value (0 = perfect correlation, 2 = perfect anti-correlation)
         """
+        # Force FP32 to avoid overflow in pairwise distance computation
+        # (FP16 can overflow with large vectors like 4096-dim latents)
+        z = z.float()
+        r = r.float()
+
         # Compute pairwise distance matrices
         D_z = pairwise_distances(z)
         D_r = pairwise_distances(r)
