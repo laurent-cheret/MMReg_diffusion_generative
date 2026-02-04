@@ -102,6 +102,9 @@ class DiffusionTrainer:
         self.scheduler = scheduler
         self.batch_size = batch_size
 
+        # Store latent shape for generation (infer from training data)
+        self.latent_shape = train_latents.shape[1:]  # (C, H, W)
+
         # Create dataloaders
         self.train_loader = DataLoader(
             LatentDataset(train_latents),
@@ -292,8 +295,8 @@ class DiffusionTrainer:
             num_samples: Number of samples to generate
 
         Returns:
-            Generated latents (num_samples, 4, 32, 32)
+            Generated latents (num_samples, C, H, W)
         """
         self.model.eval()
-        shape = (num_samples, 4, 32, 32)
+        shape = (num_samples,) + tuple(self.latent_shape)
         return self.diffusion.sample(self.model, shape, progress=True)

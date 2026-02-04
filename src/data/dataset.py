@@ -5,6 +5,7 @@ Supports:
 - Imagenette (small subset for quick testing)
 - ImageNet (full training)
 - CIFAR-10 (for debugging)
+- CelebA (faces with 40 attributes for interpolation experiments)
 
 For MM-Reg training, we need:
 1. Fixed transforms (no random augmentation) for PCA pre-computation
@@ -239,6 +240,155 @@ def get_imagenet_dataset(
     return dataset
 
 
+# CelebA attribute names for reference
+CELEBA_ATTRIBUTES = [
+    '5_o_Clock_Shadow', 'Arched_Eyebrows', 'Attractive', 'Bags_Under_Eyes',
+    'Bald', 'Bangs', 'Big_Lips', 'Big_Nose', 'Black_Hair', 'Blond_Hair',
+    'Blurry', 'Brown_Hair', 'Bushy_Eyebrows', 'Chubby', 'Double_Chin',
+    'Eyeglasses', 'Goatee', 'Gray_Hair', 'Heavy_Makeup', 'High_Cheekbones',
+    'Male', 'Mouth_Slightly_Open', 'Mustache', 'Narrow_Eyes', 'No_Beard',
+    'Oval_Face', 'Pale_Skin', 'Pointy_Nose', 'Receding_Hairline', 'Rosy_Cheeks',
+    'Sideburns', 'Smiling', 'Straight_Hair', 'Wavy_Hair', 'Wearing_Earrings',
+    'Wearing_Hat', 'Wearing_Lipstick', 'Wearing_Necklace', 'Wearing_Necktie', 'Young'
+]
+
+
+class CelebADataset(Dataset):
+    """
+    CelebA dataset wrapper that returns (image, attributes).
+
+    Attributes are a tensor of 40 binary values (0 or 1).
+    """
+    def __init__(
+        self,
+        root: str,
+        split: str = 'train',
+        transform: Optional[Callable] = None,
+        download: bool = True
+    ):
+        # Map split names
+        split_map = {'train': 'train', 'val': 'valid', 'test': 'test'}
+        celeba_split = split_map.get(split, split)
+
+        self.dataset = datasets.CelebA(
+            root=root,
+            split=celeba_split,
+            target_type='attr',
+            transform=transform,
+            download=download
+        )
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        image, attrs = self.dataset[idx]
+        # Convert attributes from -1/1 to 0/1 if needed, and to float
+        attrs = attrs.float()
+        attrs = (attrs + 1) / 2  # CelebA uses -1/1, convert to 0/1
+        return image, attrs
+
+
+class PCAEmbeddingDatasetWithAttributes(Dataset):
+    """
+    Dataset that returns images with attributes AND pre-computed PCA embeddings.
+    Returns (image, attributes, pca_embedding) tuples.
+    """
+    def __init__(
+        self,
+        base_dataset: Dataset,
+        pca_embeddings_path: str
+    ):
+        self.dataset = base_dataset
+        self.pca_embeddings = torch.load(pca_embeddings_path)
+
+        assert len(self.pca_embeddings) == len(self.dataset), \
+            f"PCA embeddings ({len(self.pca_embeddings)}) must match dataset size ({len(self.dataset)})"
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        image, attrs = self.dataset[idx]
+        pca_emb = self.pca_embeddings[idx]
+        return image, attrs, pca_emb
+
+
+def get_celeba_dataset(
+    root: str = './data',
+    split: str = 'train',
+    image_size: int = 128,
+    fixed_transform: bool = False,
+    download: bool = True
+) -> Dataset:
+    """
+    Load CelebA dataset.
+
+    Args:
+        root: Data directory
+        split: 'train', 'val', or 'test'
+        image_size: Target image size (default 128 for faces)
+        fixed_transform: Use fixed transforms (no augmentation)
+        download: Download if not present
+
+    Returns:
+        CelebADataset that returns (image, attributes)
+    """
+    if fixed_transform:
+        transform = get_fixed_transforms(image_size)
+    else:
+        transform = get_train_transforms(image_size) if split == 'train' else get_val_transforms(image_size)
+
+    dataset = CelebADataset(
+        root=root,
+        split=split,
+        transform=transform,
+        download=download
+    )
+    return dataset
+
+
+def compute_pca_embeddings_celeba(
+    dataset: Dataset,
+    n_components: int = 256,
+    batch_size: int = 64,
+    device: str = 'cuda'
+) -> torch.Tensor:
+    """
+    Compute PCA embeddings for CelebA dataset.
+
+    Similar to compute_pca_embeddings but handles (image, attrs) format.
+    """
+    from sklearn.decomposition import IncrementalPCA
+
+    pca_batch_size = max(batch_size, n_components)
+    print(f"Using batch_size={pca_batch_size} for PCA (n_components={n_components})")
+
+    loader = DataLoader(dataset, batch_size=pca_batch_size, shuffle=False, num_workers=4)
+
+    print("Fitting PCA...")
+    pca = IncrementalPCA(n_components=n_components)
+
+    for images, _ in loader:  # Ignore attributes for PCA
+        flat = images.view(images.shape[0], -1).numpy()
+        pca.partial_fit(flat)
+
+    print("Transforming samples...")
+    transform_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+    all_embeddings = []
+
+    for images, _ in transform_loader:
+        flat = images.view(images.shape[0], -1).numpy()
+        emb = pca.transform(flat)
+        all_embeddings.append(torch.from_numpy(emb).float())
+
+    embeddings = torch.cat(all_embeddings, dim=0)
+    print(f"PCA embeddings shape: {embeddings.shape}")
+    print(f"Explained variance ratio: {pca.explained_variance_ratio_.sum():.4f}")
+
+    return embeddings
+
+
 def get_dataloader(
     dataset: Dataset,
     batch_size: int = 64,
@@ -272,7 +422,7 @@ def get_dataset_and_loader(
     Get dataset and dataloader, optionally with pre-computed PCA embeddings.
 
     Args:
-        dataset_name: 'imagenette', 'cifar10', or 'imagenet'
+        dataset_name: 'imagenette', 'cifar10', 'imagenet', or 'celeba'
         root: Data directory
         split: 'train' or 'val'/'test'
         image_size: Target image size
@@ -292,12 +442,17 @@ def get_dataset_and_loader(
         dataset = get_cifar10_dataset(root, split, image_size, fixed_transform=fixed_transform)
     elif dataset_name == 'imagenet':
         dataset = get_imagenet_dataset(root, split, image_size, fixed_transform=fixed_transform)
+    elif dataset_name == 'celeba':
+        dataset = get_celeba_dataset(root, split, image_size, fixed_transform=fixed_transform)
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
     # Wrap with PCA embeddings if provided
     if pca_embeddings_path is not None:
-        dataset = PCAEmbeddingDataset(dataset, pca_embeddings_path)
+        if dataset_name == 'celeba':
+            dataset = PCAEmbeddingDatasetWithAttributes(dataset, pca_embeddings_path)
+        else:
+            dataset = PCAEmbeddingDataset(dataset, pca_embeddings_path)
 
     shuffle = (split == 'train')
     loader = get_dataloader(
