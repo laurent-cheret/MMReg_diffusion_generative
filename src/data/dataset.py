@@ -289,6 +289,134 @@ class CelebADataset(Dataset):
         return image, attrs
 
 
+class CelebAHuggingFace(Dataset):
+    """
+    CelebA dataset loaded from HuggingFace.
+
+    Avoids Google Drive rate limits.
+    """
+    def __init__(
+        self,
+        split: str = 'train',
+        transform: Optional[Callable] = None,
+        max_samples: Optional[int] = None
+    ):
+        from datasets import load_dataset
+
+        # Map split names
+        split_map = {'train': 'train', 'val': 'validation', 'test': 'test'}
+        hf_split = split_map.get(split, split)
+
+        print(f"Loading CelebA from HuggingFace (split={hf_split})...")
+        self.dataset = load_dataset("nielsr/CelebA-faces", split=hf_split)
+
+        if max_samples is not None:
+            self.dataset = self.dataset.select(range(min(max_samples, len(self.dataset))))
+
+        self.transform = transform
+
+        # HuggingFace CelebA-faces doesn't include attributes
+        # We'll return dummy attributes (zeros) - for full attributes use CelebAFromDrive
+        self.has_attributes = False
+        print(f"Loaded {len(self.dataset)} images")
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
+        image = item['image']
+
+        if self.transform:
+            image = self.transform(image)
+
+        # Return dummy attributes (40 zeros) since HF version doesn't have them
+        attrs = torch.zeros(40)
+        return image, attrs
+
+
+class CelebAFromDrive(Dataset):
+    """
+    CelebA dataset loaded from Google Drive (pre-downloaded).
+
+    Expects:
+    - images_zip: Path to img_align_celeba.zip
+    - attr_file: Path to list_attr_celeba.txt
+    - partition_file: Path to list_eval_partition.txt
+    """
+    def __init__(
+        self,
+        images_zip: str,
+        attr_file: str,
+        partition_file: str,
+        split: str = 'train',
+        transform: Optional[Callable] = None,
+        extract_dir: str = './data/celeba_extracted'
+    ):
+        import zipfile
+        from PIL import Image
+
+        self.transform = transform
+        self.extract_dir = extract_dir
+
+        # Extract images if needed
+        img_dir = os.path.join(extract_dir, 'img_align_celeba')
+        if not os.path.exists(img_dir):
+            print(f"Extracting {images_zip}...")
+            os.makedirs(extract_dir, exist_ok=True)
+            with zipfile.ZipFile(images_zip, 'r') as zip_ref:
+                zip_ref.extractall(extract_dir)
+            print("Extraction complete!")
+
+        self.img_dir = img_dir
+
+        # Load attributes
+        print("Loading attributes...")
+        self.attrs_dict = {}
+        with open(attr_file, 'r') as f:
+            lines = f.readlines()
+            # First line is count, second line is header
+            header = lines[1].strip().split()
+            for line in lines[2:]:
+                parts = line.strip().split()
+                filename = parts[0]
+                attrs = [1 if int(x) == 1 else 0 for x in parts[1:]]
+                self.attrs_dict[filename] = torch.tensor(attrs, dtype=torch.float32)
+
+        # Load partition
+        print("Loading partition...")
+        split_map = {'train': 0, 'val': 1, 'test': 2}
+        target_split = split_map.get(split, 0)
+
+        self.image_files = []
+        with open(partition_file, 'r') as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) == 2:
+                    filename, partition = parts[0], int(parts[1])
+                    if partition == target_split:
+                        self.image_files.append(filename)
+
+        print(f"Loaded {len(self.image_files)} images for split '{split}'")
+
+    def __len__(self):
+        return len(self.image_files)
+
+    def __getitem__(self, idx):
+        from PIL import Image
+
+        filename = self.image_files[idx]
+        img_path = os.path.join(self.img_dir, filename)
+
+        image = Image.open(img_path).convert('RGB')
+
+        if self.transform:
+            image = self.transform(image)
+
+        attrs = self.attrs_dict.get(filename, torch.zeros(40))
+        return image, attrs
+
+
 class PCAEmbeddingDatasetWithAttributes(Dataset):
     """
     Dataset that returns images with attributes AND pre-computed PCA embeddings.
@@ -319,10 +447,13 @@ def get_celeba_dataset(
     split: str = 'train',
     image_size: int = 128,
     fixed_transform: bool = False,
-    download: bool = True
+    download: bool = True,
+    source: str = 'auto',
+    drive_paths: Optional[dict] = None,
+    max_samples: Optional[int] = None
 ) -> Dataset:
     """
-    Load CelebA dataset.
+    Load CelebA dataset from various sources.
 
     Args:
         root: Data directory
@@ -330,22 +461,66 @@ def get_celeba_dataset(
         image_size: Target image size (default 128 for faces)
         fixed_transform: Use fixed transforms (no augmentation)
         download: Download if not present
+        source: 'auto', 'torchvision', 'huggingface', or 'drive'
+        drive_paths: Dict with 'images_zip', 'attr_file', 'partition_file' for Drive source
+        max_samples: Limit number of samples (useful for testing)
 
     Returns:
-        CelebADataset that returns (image, attributes)
+        Dataset that returns (image, attributes)
     """
     if fixed_transform:
         transform = get_fixed_transforms(image_size)
     else:
         transform = get_train_transforms(image_size) if split == 'train' else get_val_transforms(image_size)
 
-    dataset = CelebADataset(
-        root=root,
-        split=split,
-        transform=transform,
-        download=download
-    )
-    return dataset
+    # Try sources in order
+    if source == 'auto':
+        sources_to_try = ['torchvision', 'huggingface']
+        if drive_paths:
+            sources_to_try = ['drive'] + sources_to_try
+    else:
+        sources_to_try = [source]
+
+    last_error = None
+    for src in sources_to_try:
+        try:
+            if src == 'drive' and drive_paths:
+                print(f"Loading CelebA from Google Drive...")
+                dataset = CelebAFromDrive(
+                    images_zip=drive_paths['images_zip'],
+                    attr_file=drive_paths['attr_file'],
+                    partition_file=drive_paths['partition_file'],
+                    split=split,
+                    transform=transform,
+                    extract_dir=os.path.join(root, 'celeba_extracted')
+                )
+                return dataset
+
+            elif src == 'huggingface':
+                print(f"Loading CelebA from HuggingFace...")
+                dataset = CelebAHuggingFace(
+                    split=split,
+                    transform=transform,
+                    max_samples=max_samples
+                )
+                return dataset
+
+            elif src == 'torchvision':
+                print(f"Loading CelebA from torchvision...")
+                dataset = CelebADataset(
+                    root=root,
+                    split=split,
+                    transform=transform,
+                    download=download
+                )
+                return dataset
+
+        except Exception as e:
+            print(f"Failed to load from {src}: {e}")
+            last_error = e
+            continue
+
+    raise RuntimeError(f"Could not load CelebA from any source. Last error: {last_error}")
 
 
 def compute_pca_embeddings_celeba(
@@ -416,7 +591,9 @@ def get_dataset_and_loader(
     image_size: int = 256,
     batch_size: int = 64,
     num_workers: int = 4,
-    pca_embeddings_path: Optional[str] = None
+    pca_embeddings_path: Optional[str] = None,
+    celeba_source: str = 'huggingface',
+    celeba_drive_paths: Optional[dict] = None
 ) -> Tuple[Dataset, DataLoader]:
     """
     Get dataset and dataloader, optionally with pre-computed PCA embeddings.
@@ -429,6 +606,8 @@ def get_dataset_and_loader(
         batch_size: Batch size
         num_workers: Number of workers
         pca_embeddings_path: Path to pre-computed PCA embeddings (optional)
+        celeba_source: Source for CelebA ('huggingface', 'drive', 'torchvision')
+        celeba_drive_paths: Drive paths for CelebA if using drive source
 
     Returns:
         Tuple of (dataset, dataloader)
@@ -443,7 +622,12 @@ def get_dataset_and_loader(
     elif dataset_name == 'imagenet':
         dataset = get_imagenet_dataset(root, split, image_size, fixed_transform=fixed_transform)
     elif dataset_name == 'celeba':
-        dataset = get_celeba_dataset(root, split, image_size, fixed_transform=fixed_transform)
+        dataset = get_celeba_dataset(
+            root, split, image_size,
+            fixed_transform=fixed_transform,
+            source=celeba_source,
+            drive_paths=celeba_drive_paths
+        )
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
