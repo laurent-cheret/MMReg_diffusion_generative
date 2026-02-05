@@ -239,11 +239,81 @@ class SimpleUNet(nn.Module):
         return h
 
 
+class MLPDenoiser(nn.Module):
+    """
+    MLP-based denoiser for flat latent vectors (e.g. 256-d bottleneck).
+
+    Used instead of UNet when diffusion operates on 1D vectors.
+    """
+
+    def __init__(
+        self,
+        input_dim: int = 256,
+        hidden_dim: int = 1024,
+        num_layers: int = 6,
+        time_emb_dim: int = 256
+    ):
+        super().__init__()
+        self.input_dim = input_dim
+
+        # Time embedding
+        self.time_mlp = nn.Sequential(
+            nn.Linear(time_emb_dim, time_emb_dim * 4),
+            nn.SiLU(),
+            nn.Linear(time_emb_dim * 4, time_emb_dim)
+        )
+        self.time_emb_dim = time_emb_dim
+
+        # Input projection
+        self.input_proj = nn.Linear(input_dim, hidden_dim)
+
+        # Residual MLP blocks with time conditioning
+        self.blocks = nn.ModuleList()
+        self.time_projs = nn.ModuleList()
+        for _ in range(num_layers):
+            self.blocks.append(nn.Sequential(
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+            ))
+            self.time_projs.append(nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(time_emb_dim, hidden_dim)
+            ))
+
+        # Output projection
+        self.output_norm = nn.LayerNorm(hidden_dim)
+        self.output_proj = nn.Linear(hidden_dim, input_dim)
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Noisy vectors (B, D)
+            t: Timesteps (B,)
+
+        Returns:
+            Predicted noise (B, D)
+        """
+        t_emb = get_timestep_embedding(t, self.time_emb_dim)
+        t_emb = self.time_mlp(t_emb)
+
+        h = self.input_proj(x)
+
+        for block, time_proj in zip(self.blocks, self.time_projs):
+            h = h + block(h + time_proj(t_emb))
+
+        h = self.output_norm(h)
+        h = F.silu(h)
+        return self.output_proj(h)
+
+
 class GaussianDiffusion:
     """
     DDPM Gaussian Diffusion.
 
     Implements the forward (noising) and reverse (denoising) processes.
+    Works with both spatial (B, C, H, W) and flat (B, D) inputs.
     """
 
     def __init__(
@@ -278,23 +348,28 @@ class GaussianDiffusion:
         self.posterior_mean_coef1 = betas * torch.sqrt(alphas_cumprod_prev) / (1.0 - alphas_cumprod)
         self.posterior_mean_coef2 = (1.0 - alphas_cumprod_prev) * torch.sqrt(alphas) / (1.0 - alphas_cumprod)
 
+    def _expand_coeffs(self, coeffs: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """Expand coefficients to match input dimensionality (2D or 4D)."""
+        shape = [coeffs.shape[0]] + [1] * (x.ndim - 1)
+        return coeffs.view(*shape)
+
     def q_sample(self, x_0: torch.Tensor, t: torch.Tensor, noise: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward process: q(x_t | x_0).
 
         Args:
-            x_0: Clean latents (B, C, H, W)
+            x_0: Clean data (B, C, H, W) or (B, D)
             t: Timesteps (B,)
             noise: Optional pre-generated noise
 
         Returns:
-            Tuple of (noisy latents, noise)
+            Tuple of (noisy data, noise)
         """
         if noise is None:
             noise = torch.randn_like(x_0)
 
-        sqrt_alpha = self.sqrt_alphas_cumprod[t][:, None, None, None]
-        sqrt_one_minus_alpha = self.sqrt_one_minus_alphas_cumprod[t][:, None, None, None]
+        sqrt_alpha = self._expand_coeffs(self.sqrt_alphas_cumprod[t], x_0)
+        sqrt_one_minus_alpha = self._expand_coeffs(self.sqrt_one_minus_alphas_cumprod[t], x_0)
 
         x_t = sqrt_alpha * x_0 + sqrt_one_minus_alpha * noise
         return x_t, noise
