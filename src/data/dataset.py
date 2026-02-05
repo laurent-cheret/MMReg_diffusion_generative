@@ -294,6 +294,10 @@ class CelebAHuggingFace(Dataset):
     CelebA dataset loaded from HuggingFace.
 
     Avoids Google Drive rate limits.
+    The HF dataset only has a 'train' split, so we manually split:
+    - train: first 162,770 images (standard CelebA train split)
+    - val: next 19,867 images (standard CelebA val split)
+    - test: last 19,962 images (standard CelebA test split)
     """
     def __init__(
         self,
@@ -303,12 +307,22 @@ class CelebAHuggingFace(Dataset):
     ):
         from datasets import load_dataset
 
-        # Map split names
-        split_map = {'train': 'train', 'val': 'validation', 'test': 'test'}
-        hf_split = split_map.get(split, split)
+        print(f"Loading CelebA from HuggingFace (split={split})...")
+        # HF only has 'train' split with all 202,599 images
+        full_dataset = load_dataset("nielsr/CelebA-faces", split="train")
 
-        print(f"Loading CelebA from HuggingFace (split={hf_split})...")
-        self.dataset = load_dataset("nielsr/CelebA-faces", split=hf_split)
+        # Standard CelebA partition sizes
+        train_end = 162770
+        val_end = train_end + 19867  # 182637
+
+        if split == 'train':
+            self.dataset = full_dataset.select(range(train_end))
+        elif split == 'val':
+            self.dataset = full_dataset.select(range(train_end, val_end))
+        elif split == 'test':
+            self.dataset = full_dataset.select(range(val_end, len(full_dataset)))
+        else:
+            self.dataset = full_dataset
 
         if max_samples is not None:
             self.dataset = self.dataset.select(range(min(max_samples, len(self.dataset))))
@@ -318,7 +332,7 @@ class CelebAHuggingFace(Dataset):
         # HuggingFace CelebA-faces doesn't include attributes
         # We'll return dummy attributes (zeros) - for full attributes use CelebAFromDrive
         self.has_attributes = False
-        print(f"Loaded {len(self.dataset)} images")
+        print(f"Loaded {len(self.dataset)} images for split '{split}'")
 
     def __len__(self):
         return len(self.dataset)
