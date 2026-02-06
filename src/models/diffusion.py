@@ -112,6 +112,8 @@ class SimpleUNet(nn.Module):
         super().__init__()
         self.in_channels = in_channels
         self.time_emb_dim = time_emb_dim
+        self.channel_mult = channel_mult
+        self.num_res_blocks = num_res_blocks
 
         # Time embedding
         self.time_mlp = nn.Sequential(
@@ -187,25 +189,14 @@ class SimpleUNet(nn.Module):
         block_idx = 0
         downsample_idx = 0
 
-        for i, mult in enumerate(self.encoder_blocks):
-            h = self.encoder_blocks[block_idx](h, t_emb)
-            skips.append(h)
-            block_idx += 1
+        num_levels = len(self.channel_mult)
+        for level_idx in range(num_levels):
+            for _ in range(self.num_res_blocks):
+                h = self.encoder_blocks[block_idx](h, t_emb)
+                skips.append(h)
+                block_idx += 1
 
-        # Handle downsampling
-        skip_idx = 0
-        h = self.input_conv(x)
-        skips = [h]
-
-        blocks_per_level = 2  # num_res_blocks
-        for level_idx in range(len([1, 2, 4])):  # channel_mult
-            for _ in range(blocks_per_level):
-                if skip_idx < len(self.encoder_blocks):
-                    h = self.encoder_blocks[skip_idx](h, t_emb)
-                    skips.append(h)
-                    skip_idx += 1
-
-            if level_idx < len([1, 2, 4]) - 1 and downsample_idx < len(self.downsample):
+            if level_idx < num_levels - 1:
                 h = self.downsample[downsample_idx](h)
                 skips.append(h)
                 downsample_idx += 1
@@ -219,15 +210,14 @@ class SimpleUNet(nn.Module):
         block_idx = 0
         upsample_idx = 0
 
-        for level_idx in range(len([1, 2, 4])):
-            for _ in range(blocks_per_level + 1):
-                if skips and block_idx < len(self.decoder_blocks):
-                    skip = skips.pop()
-                    h = torch.cat([h, skip], dim=1)
-                    h = self.decoder_blocks[block_idx](h, t_emb)
-                    block_idx += 1
+        for level_idx in range(num_levels):
+            for _ in range(self.num_res_blocks + 1):
+                skip = skips.pop()
+                h = torch.cat([h, skip], dim=1)
+                h = self.decoder_blocks[block_idx](h, t_emb)
+                block_idx += 1
 
-            if level_idx < len([1, 2, 4]) - 1 and upsample_idx < len(self.upsample):
+            if level_idx < num_levels - 1:
                 h = self.upsample[upsample_idx](h)
                 upsample_idx += 1
 
