@@ -298,6 +298,164 @@ class MLPDenoiser(nn.Module):
         return self.output_proj(h)
 
 
+class DiTBlock(nn.Module):
+    """Transformer block with adaLN-Zero conditioning (from DiT paper)."""
+
+    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float = 4.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.attn = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
+        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+
+        mlp_hidden = int(hidden_size * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_size, mlp_hidden),
+            nn.GELU(),
+            nn.Linear(mlp_hidden, hidden_size),
+        )
+
+        # adaLN-Zero: 6 modulation parameters (gamma1, beta1, alpha1, gamma2, beta2, alpha2)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 6 * hidden_size),
+        )
+        # Zero-initialize the modulation output so blocks start as identity
+        nn.init.zeros_(self.adaLN_modulation[1].weight)
+        nn.init.zeros_(self.adaLN_modulation[1].bias)
+
+    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        # c: (B, hidden_size) conditioning vector
+        mod = self.adaLN_modulation(c).unsqueeze(1)  # (B, 1, 6*D)
+        gamma1, beta1, alpha1, gamma2, beta2, alpha2 = mod.chunk(6, dim=-1)
+
+        # Self-attention with adaLN
+        h = self.norm1(x) * (1 + gamma1) + beta1
+        h, _ = self.attn(h, h, h)
+        x = x + alpha1 * h
+
+        # MLP with adaLN
+        h = self.norm2(x) * (1 + gamma2) + beta2
+        h = self.mlp(h)
+        x = x + alpha2 * h
+
+        return x
+
+
+class DiT(nn.Module):
+    """
+    Diffusion Transformer (DiT) for latent diffusion.
+
+    Patchifies spatial latents into a token sequence, processes with
+    transformer blocks using adaLN-Zero timestep conditioning, then
+    unpatchifies back to spatial output.
+
+    DiT-S config: hidden_size=384, depth=12, num_heads=6
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 4,
+        patch_size: int = 2,
+        hidden_size: int = 384,
+        depth: int = 12,
+        num_heads: int = 6,
+        mlp_ratio: float = 4.0,
+        input_size: int = 16,
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.patch_size = patch_size
+        self.hidden_size = hidden_size
+        self.input_size = input_size
+        self.num_patches = (input_size // patch_size) ** 2
+        patch_dim = in_channels * patch_size * patch_size
+
+        # Patch embedding
+        self.patch_embed = nn.Linear(patch_dim, hidden_size)
+
+        # Positional embedding (fixed sinusoidal or learnable)
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, hidden_size))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+
+        # Timestep embedding
+        self.time_embed = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * 4),
+            nn.SiLU(),
+            nn.Linear(hidden_size * 4, hidden_size),
+        )
+
+        # Transformer blocks
+        self.blocks = nn.ModuleList([
+            DiTBlock(hidden_size, num_heads, mlp_ratio)
+            for _ in range(depth)
+        ])
+
+        # Final layer: adaLN + linear projection back to patch space
+        self.final_norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.final_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 2 * hidden_size),
+        )
+        self.final_linear = nn.Linear(hidden_size, patch_dim)
+
+        # Zero-init final layers
+        nn.init.zeros_(self.final_modulation[1].weight)
+        nn.init.zeros_(self.final_modulation[1].bias)
+        nn.init.zeros_(self.final_linear.weight)
+        nn.init.zeros_(self.final_linear.bias)
+
+    def patchify(self, x: torch.Tensor) -> torch.Tensor:
+        """(B, C, H, W) -> (B, num_patches, patch_dim)"""
+        B, C, H, W = x.shape
+        p = self.patch_size
+        x = x.reshape(B, C, H // p, p, W // p, p)
+        x = x.permute(0, 2, 4, 1, 3, 5)  # (B, H//p, W//p, C, p, p)
+        x = x.reshape(B, self.num_patches, -1)
+        return x
+
+    def unpatchify(self, x: torch.Tensor) -> torch.Tensor:
+        """(B, num_patches, patch_dim) -> (B, C, H, W)"""
+        B = x.shape[0]
+        p = self.patch_size
+        h = w = self.input_size // p
+        C = self.in_channels
+        x = x.reshape(B, h, w, C, p, p)
+        x = x.permute(0, 3, 1, 4, 2, 5)  # (B, C, h, p, w, p)
+        x = x.reshape(B, C, self.input_size, self.input_size)
+        return x
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Noisy latents (B, C, H, W)
+            t: Timesteps (B,)
+        Returns:
+            Predicted noise (B, C, H, W)
+        """
+        # Timestep conditioning
+        t_emb = get_timestep_embedding(t, self.hidden_size)
+        c = self.time_embed(t_emb)  # (B, hidden_size)
+
+        # Patchify + embed
+        x = self.patchify(x)          # (B, N, patch_dim)
+        x = self.patch_embed(x)       # (B, N, hidden_size)
+        x = x + self.pos_embed        # add positional embedding
+
+        # Transformer blocks
+        for block in self.blocks:
+            x = block(x, c)
+
+        # Final layer with adaLN
+        mod = self.final_modulation(c).unsqueeze(1)
+        gamma, beta = mod.chunk(2, dim=-1)
+        x = self.final_norm(x) * (1 + gamma) + beta
+        x = self.final_linear(x)      # (B, N, patch_dim)
+
+        # Unpatchify back to spatial
+        x = self.unpatchify(x)         # (B, C, H, W)
+        return x
+
+
 class GaussianDiffusion:
     """
     DDPM Gaussian Diffusion.
