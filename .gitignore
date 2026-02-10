@@ -38,3 +38,6 @@ Thumbs.db
 wandb/
 runs/
 .claude/
+
+# Plans
+implementation_plan.md
