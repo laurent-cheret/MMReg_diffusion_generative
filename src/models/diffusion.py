@@ -456,6 +456,18 @@ class DiT(nn.Module):
         return x
 
 
+def cosine_beta_schedule(num_timesteps: int, s: float = 0.008) -> torch.Tensor:
+    """
+    Cosine beta schedule from Improved DDPM (Nichol & Dhariwal, 2021).
+    Provides more uniform SNR distribution across timesteps than linear.
+    """
+    steps = torch.arange(num_timesteps + 1, dtype=torch.float64)
+    f_t = torch.cos(((steps / num_timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
+    alphas_cumprod = f_t / f_t[0]
+    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+    return torch.clamp(betas, 0, 0.999).float()
+
+
 class GaussianDiffusion:
     """
     DDPM Gaussian Diffusion.
@@ -469,13 +481,16 @@ class GaussianDiffusion:
         num_timesteps: int = 1000,
         beta_start: float = 0.0001,
         beta_end: float = 0.02,
+        schedule: str = 'linear',
         device: str = 'cuda'
     ):
         self.num_timesteps = num_timesteps
         self.device = device
 
-        # Linear beta schedule
-        betas = torch.linspace(beta_start, beta_end, num_timesteps, device=device)
+        if schedule == 'cosine':
+            betas = cosine_beta_schedule(num_timesteps).to(device)
+        else:
+            betas = torch.linspace(beta_start, beta_end, num_timesteps, device=device)
 
         alphas = 1.0 - betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)
